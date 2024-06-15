@@ -1,0 +1,350 @@
+package org.sprinklr.grep;
+
+import java.io.*;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
+import java.nio.charset.StandardCharsets;
+import java.util.List;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+public class ParallelFileReader {
+    BlockingQueue<String> linesQueue = new LinkedBlockingQueue<>();
+    int PRODUCER_THREADS;
+    int CONSUMER_THREADS;
+    String filePath;
+    MyOptions myOptions;
+    AtomicInteger activeProducers;
+    List<Pattern> regexPatterns;
+    LineResult.Builder builder;
+    Result grepResult;
+    static int LINE_SEP_LEN=System.lineSeparator().getBytes().length;
+
+    public ParallelFileReader(MyOptions myOptions,int PRODUCER_THREADS, int CONSUMER_THREADS, String filePath,List<Pattern> regexPatterns) {
+        this.PRODUCER_THREADS = PRODUCER_THREADS;
+        this.CONSUMER_THREADS = CONSUMER_THREADS;
+        this.filePath = filePath;
+        this.myOptions=myOptions;
+        this.regexPatterns=regexPatterns;
+        this.builder=new LineResult.Builder(myOptions);
+        this.activeProducers=new AtomicInteger();
+        this.grepResult=new Result();
+    }
+
+    private long adjustEndLocation(FileChannel channel, long endLocation) throws Exception {
+        ByteBuffer buffer = ByteBuffer.allocate(1);
+        while (endLocation < channel.size() - 1) {
+            channel.read(buffer, endLocation);
+            buffer.flip();
+            if (buffer.get() == '\n') {
+                break;
+            }
+            buffer.clear();
+            endLocation++;
+        }
+        return endLocation;
+    }
+
+    /*
+     * helper method at the time of debugging
+     * used to get character at a pos; used to verify each character is a starting character;
+     * */
+    private char getCharAtPos(FileChannel channel, long pos) {
+        try {
+            channel.position(pos);
+            // Read a single byte at the specified position
+            ByteBuffer buffer = ByteBuffer.allocate(1);
+            int bytesRead = channel.read(buffer);
+            if (bytesRead != -1) {
+                buffer.flip();
+                byte[] bytes = new byte[buffer.remaining()];
+                buffer.get(bytes);
+                char character = new String(bytes, StandardCharsets.UTF_8).charAt(0);
+//                System.out.println("Character at position " + pos + ": " + character);
+                return character;
+            } else {
+                System.out.println("End of file reached.");
+            }
+            return '@';
+        } catch (Exception e){
+            System.out.println("----------" + e);
+        }
+        return '@';
+    }
+
+    public void execute() {
+        try(FileInputStream fileInputStream= new FileInputStream(filePath);
+            FileChannel channel = fileInputStream.getChannel()){
+
+            long fileSize = channel.size();
+            System.out.println("file size = "+fileSize);
+            long chunkSize = fileSize / PRODUCER_THREADS;
+
+            ExecutorService executor = Executors.newFixedThreadPool(PRODUCER_THREADS+CONSUMER_THREADS+1);
+//            RejectedExecutionHandler rejectedExecutionHandler = new ThreadPoolExecutor.CallerRunsPolicy();
+//            BlockingQueue<Runnable>taskQueueProducer = new ArrayBlockingQueue<>(100);
+//            ExecutorService producerExecutor= new ThreadPoolExecutor(this.PRODUCER_THREADS,this.PRODUCER_THREADS,0,TimeUnit.NANOSECONDS,taskQueueProducer,rejectedExecutionHandler);
+//
+//            BlockingQueue<Runnable>taskQueueConsumer = new ArrayBlockingQueue<>(100);
+//            ExecutorService consumerExecutor= new ThreadPoolExecutor(this.CONSUMER_THREADS,this.CONSUMER_THREADS,0,TimeUnit.NANOSECONDS,taskQueueConsumer,rejectedExecutionHandler);
+
+            AtomicInteger linesPut=new AtomicInteger();
+            AtomicInteger linesConsumed=new AtomicInteger();
+            long position = 0;
+            for (int i=0; i<PRODUCER_THREADS; i++) {
+                long start = position;
+                long end = (i == PRODUCER_THREADS - 1) ? fileSize : position + chunkSize;
+                long newEnd;
+                if (i < PRODUCER_THREADS - 1) {
+                    newEnd= adjustEndLocation(channel, end);
+                } else {
+                    newEnd=end;
+                }
+//                System.out.println("startPos=" + start + " endPos=" + newEnd);
+//                System.out.println("stChar=" + getCharAtPos(channel,start));
+                executor.submit(new Producer(filePath,start,newEnd,linesPut,activeProducers));
+//                producerExecutor.submit(new Producer(filePath,start,newEnd,linesPut,activeProducers));
+                position = newEnd+1;
+            }
+
+            for(int i=0; i<CONSUMER_THREADS; i++){
+                executor.submit(new Consumer(linesConsumed));
+//                consumerExecutor.submit(new Consumer(linesConsumed));
+            }
+
+            executor.shutdown();
+//            producerExecutor.shutdown();
+//            consumerExecutor.shutdown();
+            try {
+                executor.awaitTermination(Long.MAX_VALUE,TimeUnit.NANOSECONDS);
+//                producerExecutor.awaitTermination(Long.MAX_VALUE, TimeUnit.NANOSECONDS);
+//                consumerExecutor.awaitTermination(Long.MAX_VALUE, TimeUnit.NANOSECONDS);
+            } catch (Exception e){
+                System.out.println("Exception caught : " + e);
+                e.printStackTrace();
+            } finally {
+//                System.out.println( " ... " + linesPut.get() + " lines put in the queue !!!");
+//                System.out.println( " ... " + linesConsumed.get() + " lines consumed from the queue !!!");
+            }
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+
+    public class Producer implements Runnable{
+        RandomAccessFile randomAccessFile;
+        long start;
+        long end;
+        long sizeLimit;
+        AtomicInteger countLines;
+        AtomicInteger activeProducers;
+
+        public Producer(String filePath, long start, long end, AtomicInteger countLines, AtomicInteger activeProducers) {
+            try {
+                this.randomAccessFile = new RandomAccessFile(filePath,"r");
+            } catch (FileNotFoundException e) {
+                throw new RuntimeException(e);
+            }
+            this.start = start;
+            this.end = end;
+            this.sizeLimit=this.end-this.start;
+            this.activeProducers=activeProducers;
+            this.countLines=countLines;
+        }
+
+        @Override
+        public void run() {
+            try {
+                activeProducers.incrementAndGet();
+    //                System.out.println(" prodcuer {started} : " + activeProducers.get() +" with st="+start+" end="+end);
+
+                randomAccessFile.seek(start);
+                BufferedReader bufferedReader = new BufferedReader(new InputStreamReader(new FileInputStream(randomAccessFile.getFD())));
+
+                int bytesReadTillNow=0;
+                String line;
+                while((line=bufferedReader.readLine())!=null){
+                    int bytesReadFromLine=line.length() + LINE_SEP_LEN;
+
+                    bytesReadTillNow+=bytesReadFromLine;
+    //                    System.out.println(Thread.currentThread().getName()+" processed line='"+line+"'" + " read"+bytesReadFromLine+"bytes" );
+
+    //                    countLines.incrementAndGet();
+                    linesQueue.put(line);
+                    if (bytesReadTillNow > sizeLimit) {
+                        break;
+                    }
+                }
+            } catch (Exception e) {
+                e.printStackTrace();
+            } finally {
+                activeProducers.decrementAndGet();
+    //                System.out.println(" prodcuer {ended} : " + activeProducers.get());
+            }
+        }
+    }
+
+    private class Consumer implements Runnable {
+        private AtomicInteger linesConsumed;
+
+        public Consumer(AtomicInteger linesConsumed) {
+            this.linesConsumed = linesConsumed;
+        }
+
+        @Override
+        public void run(){
+            try {
+                String lineData;
+                while (activeProducers.get()>0 || !linesQueue.isEmpty() ) {
+                    lineData=linesQueue.poll(1,TimeUnit.MILLISECONDS);
+                    if(lineData==null) continue;
+//                    linesConsumed.incrementAndGet();
+//                    System.out.println( Thread.currentThread().getName()+ " consumed line : " + lineData);
+
+                    for (Pattern pattern : regexPatterns) {
+                        Matcher matcher = pattern.matcher(lineData);
+                        while(matcher.find()) {
+                            LineResult lineResult = builder.build(null, matcher.group(), null, pattern);
+                            grepResult.addResult(lineResult);
+                        }
+                    }
+//                    System.out.println(Thread.currentThread().getName() + ": File - " + lineData.getFile() + ", Line Number - " + lineData.getLineNumber() + ", Content - " + lineData.getLineContent());
+                }
+//                System.out.println(Thread.currentThread().getName() + "found no active producers and the queue was empty.");
+            } catch (Exception e) {
+                e.printStackTrace();
+//                Thread.currentThread().interrupt();
+            } finally {
+//                System.out.println(" consumer DIED !!!!!!");
+            }
+        }
+    }
+}
+
+
+
+
+_______________________________________________________________________________________
+
+
+
+package org.sprinklr.grep;
+
+import java.io.*;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Paths;
+import java.util.List;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+public class ParallelFileReader {
+    BlockingQueue<String> linesQueue = new LinkedBlockingQueue<>();
+    int PRODUCER_THREADS;
+    int CONSUMER_THREADS;
+    String filePath;
+    MyOptions myOptions;
+    AtomicInteger activeProducers;
+    List<Pattern> regexPatterns;
+    LineResult.Builder builder;
+    Result grepResult;
+    static int LINE_SEP_LEN=System.lineSeparator().getBytes().length;
+
+    public ParallelFileReader(MyOptions myOptions,int PRODUCER_THREADS, int CONSUMER_THREADS, String filePath,List<Pattern> regexPatterns) {
+        this.PRODUCER_THREADS = PRODUCER_THREADS;
+        this.CONSUMER_THREADS = CONSUMER_THREADS;
+        this.filePath = filePath;
+        this.myOptions=myOptions;
+        this.regexPatterns=regexPatterns;
+        this.builder=new LineResult.Builder(myOptions);
+        this.activeProducers=new AtomicInteger();
+        this.grepResult=new Result();
+    }
+
+    public void execute() {
+        ExecutorService executor = Executors.newFixedThreadPool(PRODUCER_THREADS + CONSUMER_THREADS);
+        try (FileChannel channel = FileChannel.open(Paths.get(filePath))) {
+            long fileSize = channel.size();
+            long chunkSize = fileSize / PRODUCER_THREADS;
+
+            for (int i = 0; i < PRODUCER_THREADS; i++) {
+                long start = i * chunkSize;
+                long end = (i == PRODUCER_THREADS - 1) ? fileSize : (i + 1) * chunkSize;
+                executor.submit(new Producer(channel, start, end));
+            }
+
+            for (int i = 0; i < CONSUMER_THREADS; i++) {
+                executor.submit(new Consumer());
+            }
+
+            executor.shutdown();
+            executor.awaitTermination(Long.MAX_VALUE, TimeUnit.NANOSECONDS);
+        } catch (IOException | InterruptedException e) {
+            e.printStackTrace();
+        }
+    }
+
+    private class Producer implements Runnable {
+        private final FileChannel channel;
+        private final long start;
+        private final long end;
+
+        public Producer(FileChannel channel, long start, long end) {
+            this.channel = channel;
+            this.start = start;
+            this.end = end;
+        }
+
+        @Override
+        public void run() {
+            try {
+                activeProducers.incrementAndGet();
+                ByteBuffer buffer = ByteBuffer.allocate((int) (end - start));
+                channel.read(buffer, start);
+                buffer.flip();
+                String chunk = StandardCharsets.UTF_8.decode(buffer).toString();
+                String[] lines = chunk.split("\n");
+                for (String line : lines) {
+                    linesQueue.put(line);
+                }
+            } catch (IOException | InterruptedException e) {
+                e.printStackTrace();
+            } finally {
+                activeProducers.decrementAndGet();
+            }
+        }
+    }
+
+    private class Consumer implements Runnable {
+        @Override
+        public void run() {
+            try {
+                while (activeProducers.get()>0 || !linesQueue.isEmpty()) {
+                    String line = linesQueue.poll(1, TimeUnit.MILLISECONDS);
+                    if (line == null) continue;
+
+                    for (Pattern pattern : regexPatterns) {
+                        Matcher matcher = pattern.matcher(line);
+                        while (matcher.find()) {
+                            LineResult lineResult = builder.build(null, matcher.group(), null, pattern);
+                            grepResult.addResult(lineResult);
+                        }
+                    }
+                }
+            } catch (InterruptedException e) {
+                e.printStackTrace();
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+}
+
+___________________________________________________________________
+
+
+

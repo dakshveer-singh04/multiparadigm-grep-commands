@@ -1,0 +1,8 @@
+<component name="ArtifactManager">
+  <artifact type="jar" name="multiFileGrep:jar">
+    <output-path>$PROJECT_DIR$/out/artifacts/multiFileGrep_jar</output-path>
+    <root id="archive" name="multiFileGrep.jar">
+      <element id="module-output" name="multiFileGrep" />
+    </root>
+  </artifact>
+</component>

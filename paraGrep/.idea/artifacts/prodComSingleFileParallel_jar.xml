@@ -1,0 +1,8 @@
+<component name="ArtifactManager">
+  <artifact type="jar" name="prodComSingleFileParallel:jar">
+    <output-path>$PROJECT_DIR$/out/artifacts/prodComSingleFileParallel_jar</output-path>
+    <root id="archive" name="prodComSingleFileParallel.jar">
+      <element id="module-output" name="prodComSingleFileParallel" />
+    </root>
+  </artifact>
+</component>
